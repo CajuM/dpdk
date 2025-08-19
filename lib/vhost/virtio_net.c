@@ -647,54 +647,10 @@ vhost_shadow_enqueue_single_packed(struct virtio_net *dev,
 static __rte_always_inline void
 virtio_enqueue_offload(struct rte_mbuf *m_buf, struct virtio_net_hdr *net_hdr)
 {
-	uint64_t csum_l4 = m_buf->ol_flags & RTE_MBUF_F_TX_L4_MASK;
+	net_hdr->flags = VIRTIO_NET_HDR_F_DATA_VALID;
 
-	if (m_buf->ol_flags & RTE_MBUF_F_TX_TCP_SEG)
-		csum_l4 |= RTE_MBUF_F_TX_TCP_CKSUM;
-
-	if (csum_l4) {
-		/*
-		 * Pseudo-header checksum must be set as per Virtio spec.
-		 *
-		 * Note: We don't propagate rte_net_intel_cksum_prepare()
-		 * errors, as it would have an impact on performance, and an
-		 * error would mean the packet is dropped by the guest instead
-		 * of being dropped here.
-		 */
-		rte_net_intel_cksum_prepare(m_buf);
-
-		net_hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-		net_hdr->csum_start = m_buf->l2_len + m_buf->l3_len;
-
-		switch (csum_l4) {
-		case RTE_MBUF_F_TX_TCP_CKSUM:
-			net_hdr->csum_offset = (offsetof(struct rte_tcp_hdr,
-						cksum));
-			break;
-		case RTE_MBUF_F_TX_UDP_CKSUM:
-			net_hdr->csum_offset = (offsetof(struct rte_udp_hdr,
-						dgram_cksum));
-			break;
-		case RTE_MBUF_F_TX_SCTP_CKSUM:
-			net_hdr->csum_offset = (offsetof(struct rte_sctp_hdr,
-						cksum));
-			break;
-		}
-	} else {
-		ASSIGN_UNLESS_EQUAL(net_hdr->csum_start, 0);
-		ASSIGN_UNLESS_EQUAL(net_hdr->csum_offset, 0);
-		ASSIGN_UNLESS_EQUAL(net_hdr->flags, 0);
-	}
-
-	/* IP cksum verification cannot be bypassed, then calculate here */
-	if (m_buf->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
-		struct rte_ipv4_hdr *ipv4_hdr;
-
-		ipv4_hdr = rte_pktmbuf_mtod_offset(m_buf, struct rte_ipv4_hdr *,
-						   m_buf->l2_len);
-		ipv4_hdr->hdr_checksum = 0;
-		ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
-	}
+	ASSIGN_UNLESS_EQUAL(net_hdr->csum_start, 0);
+	ASSIGN_UNLESS_EQUAL(net_hdr->csum_offset, 0);
 
 	if (m_buf->ol_flags & RTE_MBUF_F_TX_TCP_SEG) {
 		if (m_buf->ol_flags & RTE_MBUF_F_TX_IPV4)
@@ -2712,31 +2668,7 @@ vhost_dequeue_offload_legacy(struct virtio_net *dev, struct virtio_net_hdr *hdr,
 	if (parse_headers(m, &l4_proto) < 0)
 		return;
 
-	if (hdr->flags == VIRTIO_NET_HDR_F_NEEDS_CSUM) {
-		if (hdr->csum_start == (m->l2_len + m->l3_len)) {
-			switch (hdr->csum_offset) {
-			case (offsetof(struct rte_tcp_hdr, cksum)):
-				if (l4_proto != IPPROTO_TCP)
-					goto error;
-				m->ol_flags |= RTE_MBUF_F_TX_TCP_CKSUM;
-				break;
-			case (offsetof(struct rte_udp_hdr, dgram_cksum)):
-				if (l4_proto != IPPROTO_UDP)
-					goto error;
-				m->ol_flags |= RTE_MBUF_F_TX_UDP_CKSUM;
-				break;
-			case (offsetof(struct rte_sctp_hdr, cksum)):
-				if (l4_proto != IPPROTO_SCTP)
-					goto error;
-				m->ol_flags |= RTE_MBUF_F_TX_SCTP_CKSUM;
-				break;
-			default:
-				goto error;
-			}
-		} else {
-			goto error;
-		}
-	}
+	m->ol_flags |= RTE_MBUF_F_TX_L4_NO_CKSUM;
 
 	if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
 		if (hdr->gso_size == 0)
@@ -2795,7 +2727,8 @@ vhost_dequeue_offload(struct virtio_net *dev, struct virtio_net_hdr *hdr,
 		return;
 	}
 
-	m->ol_flags |= RTE_MBUF_F_RX_IP_CKSUM_UNKNOWN;
+	m->ol_flags |= RTE_MBUF_F_RX_IP_CKSUM_GOOD;
+	m->ol_flags |= RTE_MBUF_F_RX_L4_CKSUM_GOOD;
 
 	ptype = rte_net_get_ptype(m, &hdr_lens, RTE_PTYPE_ALL_MASK);
 	m->packet_type = ptype;
@@ -2803,48 +2736,6 @@ vhost_dequeue_offload(struct virtio_net *dev, struct virtio_net_hdr *hdr,
 	    (ptype & RTE_PTYPE_L4_MASK) == RTE_PTYPE_L4_UDP ||
 	    (ptype & RTE_PTYPE_L4_MASK) == RTE_PTYPE_L4_SCTP)
 		l4_supported = 1;
-
-	/* According to Virtio 1.1 spec, the device only needs to look at
-	 * VIRTIO_NET_HDR_F_NEEDS_CSUM in the packet transmission path.
-	 * This differs from the processing incoming packets path where the
-	 * driver could rely on VIRTIO_NET_HDR_F_DATA_VALID flag set by the
-	 * device.
-	 *
-	 * 5.1.6.2.1 Driver Requirements: Packet Transmission
-	 * The driver MUST NOT set the VIRTIO_NET_HDR_F_DATA_VALID and
-	 * VIRTIO_NET_HDR_F_RSC_INFO bits in flags.
-	 *
-	 * 5.1.6.2.2 Device Requirements: Packet Transmission
-	 * The device MUST ignore flag bits that it does not recognize.
-	 */
-	if (hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) {
-		uint32_t hdrlen;
-
-		hdrlen = hdr_lens.l2_len + hdr_lens.l3_len + hdr_lens.l4_len;
-		if (hdr->csum_start <= hdrlen && l4_supported != 0) {
-			m->ol_flags |= RTE_MBUF_F_RX_L4_CKSUM_NONE;
-		} else {
-			/* Unknown proto or tunnel, do sw cksum. We can assume
-			 * the cksum field is in the first segment since the
-			 * buffers we provided to the host are large enough.
-			 * In case of SCTP, this will be wrong since it's a CRC
-			 * but there's nothing we can do.
-			 */
-			uint16_t csum = 0, off;
-
-			if (hdr->csum_start >= rte_pktmbuf_pkt_len(m))
-				return;
-
-			if (rte_raw_cksum_mbuf(m, hdr->csum_start,
-					rte_pktmbuf_pkt_len(m) - hdr->csum_start, &csum) < 0)
-				return;
-			if (likely(csum != 0xffff))
-				csum = ~csum;
-			off = hdr->csum_offset + hdr->csum_start;
-			if (rte_pktmbuf_data_len(m) >= off + 1)
-				*rte_pktmbuf_mtod_offset(m, uint16_t *, off) = csum;
-		}
-	}
 
 	if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
 		if (hdr->gso_size == 0)
@@ -2855,13 +2746,13 @@ vhost_dequeue_offload(struct virtio_net *dev, struct virtio_net_hdr *hdr,
 		case VIRTIO_NET_HDR_GSO_TCPV6:
 			if ((ptype & RTE_PTYPE_L4_MASK) != RTE_PTYPE_L4_TCP)
 				break;
-			m->ol_flags |= RTE_MBUF_F_RX_LRO | RTE_MBUF_F_RX_L4_CKSUM_NONE;
+			m->ol_flags |= RTE_MBUF_F_RX_LRO;
 			m->tso_segsz = hdr->gso_size;
 			break;
 		case VIRTIO_NET_HDR_GSO_UDP:
 			if ((ptype & RTE_PTYPE_L4_MASK) != RTE_PTYPE_L4_UDP)
 				break;
-			m->ol_flags |= RTE_MBUF_F_RX_LRO | RTE_MBUF_F_RX_L4_CKSUM_NONE;
+			m->ol_flags |= RTE_MBUF_F_RX_LRO;
 			m->tso_segsz = hdr->gso_size;
 			break;
 		default:

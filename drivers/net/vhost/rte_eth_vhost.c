@@ -317,41 +317,6 @@ vhost_dev_csum_configure(struct rte_eth_dev *eth_dev)
 static void
 vhost_dev_tx_sw_csum(struct rte_mbuf *mbuf)
 {
-	uint32_t hdr_len;
-	uint16_t csum = 0, csum_offset;
-
-	switch (mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK) {
-	case RTE_MBUF_F_TX_L4_NO_CKSUM:
-		return;
-	case RTE_MBUF_F_TX_TCP_CKSUM:
-		csum_offset = offsetof(struct rte_tcp_hdr, cksum);
-		break;
-	case RTE_MBUF_F_TX_UDP_CKSUM:
-		csum_offset = offsetof(struct rte_udp_hdr, dgram_cksum);
-		break;
-	default:
-		/* Unsupported packet type. */
-		return;
-	}
-
-	hdr_len = mbuf->l2_len + mbuf->l3_len;
-	csum_offset += hdr_len;
-
-	/* Prepare the pseudo-header checksum */
-	if (rte_net_intel_cksum_prepare(mbuf) < 0)
-		return;
-
-	if (rte_raw_cksum_mbuf(mbuf, hdr_len, rte_pktmbuf_pkt_len(mbuf) - hdr_len, &csum) < 0)
-		return;
-
-	csum = ~csum;
-	/* See RFC768 */
-	if (unlikely((mbuf->packet_type & RTE_PTYPE_L4_UDP) && csum == 0))
-		csum = 0xffff;
-
-	if (rte_pktmbuf_data_len(mbuf) >= csum_offset + 1)
-		*rte_pktmbuf_mtod_offset(mbuf, uint16_t *, csum_offset) = csum;
-
 	mbuf->ol_flags &= ~RTE_MBUF_F_TX_L4_MASK;
 	mbuf->ol_flags |= RTE_MBUF_F_TX_L4_NO_CKSUM;
 }
@@ -359,42 +324,6 @@ vhost_dev_tx_sw_csum(struct rte_mbuf *mbuf)
 static void
 vhost_dev_rx_sw_csum(struct rte_mbuf *mbuf)
 {
-	struct rte_net_hdr_lens hdr_lens;
-	uint32_t ptype, hdr_len;
-	uint16_t csum = 0, csum_offset;
-
-	/* Return early if the L4 checksum was not offloaded */
-	if ((mbuf->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_MASK) != RTE_MBUF_F_RX_L4_CKSUM_NONE)
-		return;
-
-	ptype = rte_net_get_ptype(mbuf, &hdr_lens, RTE_PTYPE_ALL_MASK);
-
-	hdr_len = hdr_lens.l2_len + hdr_lens.l3_len;
-
-	switch (ptype & RTE_PTYPE_L4_MASK) {
-	case RTE_PTYPE_L4_TCP:
-		csum_offset = offsetof(struct rte_tcp_hdr, cksum) + hdr_len;
-		break;
-	case RTE_PTYPE_L4_UDP:
-		csum_offset = offsetof(struct rte_udp_hdr, dgram_cksum) + hdr_len;
-		break;
-	default:
-		/* Unsupported packet type */
-		return;
-	}
-
-	/* The pseudo-header checksum is already performed, as per Virtio spec */
-	if (rte_raw_cksum_mbuf(mbuf, hdr_len, rte_pktmbuf_pkt_len(mbuf) - hdr_len, &csum) < 0)
-		return;
-
-	csum = ~csum;
-	/* See RFC768 */
-	if (unlikely((ptype & RTE_PTYPE_L4_UDP) && csum == 0))
-		csum = 0xffff;
-
-	if (rte_pktmbuf_data_len(mbuf) >= csum_offset + 1)
-		*rte_pktmbuf_mtod_offset(mbuf, uint16_t *, csum_offset) = csum;
-
 	mbuf->ol_flags &= ~RTE_MBUF_F_RX_L4_CKSUM_MASK;
 	mbuf->ol_flags |= RTE_MBUF_F_RX_L4_CKSUM_GOOD;
 }
